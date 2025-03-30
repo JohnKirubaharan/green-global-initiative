@@ -1,0 +1,218 @@
+## 2. GitHub Actions Workflow Definition
+
+```yaml
+# Main CI/CD workflow for Low-Code and RPA integration
+name: Power Apps CI/CD Pipeline
+
+# Triggers for the workflow
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment Environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - testing
+          - staging
+          - production
+
+# Define environment variables
+env:
+  POWER_APPS_ENVIRONMENT: ${{ github.event.inputs.environment || 'development' }}
+  POWER_PLATFORM_CLIENT_ID: ${{ secrets.POWER_PLATFORM_CLIENT_ID }}
+  POWER_PLATFORM_CLIENT_SECRET: ${{ secrets.POWER_PLATFORM_CLIENT_SECRET }}
+  UIPATH_ORCHESTRATOR_URL: ${{ secrets.UIPATH_ORCHESTRATOR_URL }}
+  UIPATH_TENANT_NAME: ${{ secrets.UIPATH_TENANT_NAME }}
+  UIPATH_CLIENT_ID: ${{ secrets.UIPATH_CLIENT_ID }}
+  UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+
+# Jobs definition
+jobs:
+  # Build and export Power Apps solution
+  build:
+    name: Build and Export Power Apps Solution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Power Platform Tools
+        uses: microsoft/powerplatform-actions/setup-tools@v1
+        
+      - name: Power Platform Authentication
+        uses: microsoft/powerplatform-actions/auth@v1
+        with:
+          app-id: ${{ env.POWER_PLATFORM_CLIENT_ID }}
+          client-secret: ${{ env.POWER_PLATFORM_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.POWER_PLATFORM_TENANT_ID }}
+      
+      - name: Export Solution from Development
+        uses: microsoft/powerplatform-actions/export-solution@v1
+        with:
+          environment-url: ${{ secrets.POWER_PLATFORM_ENV_URL }}
+          solution-name: 'MyLowCodeApp'
+          solution-output-file: 'solution.zip'
+          managed: false
+      
+      - name: Upload solution artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: power-apps-solution
+          path: solution.zip
+
+  # Static analysis and validation
+  validate:
+    name: Validate Solution
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Download solution artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: power-apps-solution
+      
+      - name: Set up Power Platform Tools
+        uses: microsoft/powerplatform-actions/setup-tools@v1
+      
+      - name: Analyze solution components
+        uses: microsoft/powerplatform-actions/check-solution@v1
+        with:
+          solution-file: 'solution.zip'
+          fail-on-error: true
+      
+      - name: Generate solution documentation
+        uses: microsoft/powerplatform-actions/document-solution@v1
+        with:
+          solution-file: 'solution.zip'
+          output-file: 'solution-docs.md'
+      
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: solution-documentation
+          path: solution-docs.md
+
+  # Automated testing with UiPath RPA
+  test:
+    name: Run RPA Tests
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Download solution artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: power-apps-solution
+      
+      - name: Set up Power Platform Tools
+        uses: microsoft/powerplatform-actions/setup-tools@v1
+      
+      - name: Deploy to test environment
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ secrets.POWER_PLATFORM_TEST_URL }}
+          app-id: ${{ env.POWER_PLATFORM_CLIENT_ID }}
+          client-secret: ${{ env.POWER_PLATFORM_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.POWER_PLATFORM_TENANT_ID }}
+          solution-file: 'solution.zip'
+          force-overwrite: true
+      
+      - name: Set up UiPath CLI
+        run: |
+          Invoke-WebRequest -Uri "https://www.myget.org/F/uipath-dev/api/v2/package/UiPath.CLI/1.0.7802.11617" -OutFile "uipath-cli.nupkg"
+          Expand-Archive -Path "uipath-cli.nupkg" -DestinationPath "uipath-cli"
+          $env:PATH = "$env:PATH;$pwd\uipath-cli\tools"
+      
+      - name: Authenticate to UiPath Orchestrator
+        run: |
+          uipcli authenticate --url ${{ env.UIPATH_ORCHESTRATOR_URL }} --tenant ${{ env.UIPATH_TENANT_NAME }} --client_id ${{ env.UIPATH_CLIENT_ID }} --client_secret ${{ env.UIPATH_CLIENT_SECRET }}
+      
+      - name: Run Functional Tests via UiPath
+        run: |
+          uipcli job start --process "PowerApps_Functional_Tests" --robot "TestRunner" --input "{'AppUrl':'${{ secrets.TEST_APP_URL }}','TestCases':['Login','CreateRecord','EditRecord','DeleteRecord']}"
+          uipcli status poll --id $jobId --timeout 1800
+      
+      - name: Run Integration Tests via UiPath
+        run: |
+          uipcli job start --process "PowerApps_Integration_Tests" --robot "TestRunner" --input "{'AppUrl':'${{ secrets.TEST_APP_URL }}','TestScenarios':['EndToEnd','DataIntegration']}"
+          uipcli status poll --id $jobId --timeout 1800
+      
+      - name: Collect and Process Test Results
+        run: |
+          uipcli job result $jobId --output "test-results.json"
+          Get-Content "test-results.json" | ConvertFrom-Json | ConvertTo-Csv | Out-File "test-results.csv"
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: uipath-test-results
+          path: test-results.csv
+
+  # Deploy to staging/production
+  deploy:
+    name: Deploy Solution
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - name: Download solution artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: power-apps-solution
+      
+      - name: Set up Power Platform Tools
+        uses: microsoft/powerplatform-actions/setup-tools@v1
+      
+      - name: Power Platform Authentication
+        uses: microsoft/powerplatform-actions/auth@v1
+        with:
+          app-id: ${{ env.POWER_PLATFORM_CLIENT_ID }}
+          client-secret: ${{ env.POWER_PLATFORM_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.POWER_PLATFORM_TENANT_ID }}
+      
+      - name: Prepare managed solution
+        if: ${{ github.event.inputs.environment == 'production' || github.ref == 'refs/heads/main' }}
+        uses: microsoft/powerplatform-actions/pack-solution@v1
+        with:
+          solution-folder: 'solution'
+          solution-file: 'managed-solution.zip'
+          solution-type: 'Managed'
+      
+      - name: Deploy solution
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ secrets.POWER_PLATFORM_TARGET_URL }}
+          solution-file: ${{ github.event.inputs.environment == 'production' || github.ref == 'refs/heads/main' ? 'managed-solution.zip' : 'solution.zip' }}
+          force-overwrite: true
+      
+      - name: Run post-deployment verification
+        run: |
+          uipcli job start --process "PowerApps_Deployment_Verification" --robot "VerificationBot" --input "{'AppUrl':'${{ secrets.DEPLOYED_APP_URL }}'}"
+          uipcli status poll --id $jobId --timeout 900
+      
+      - name: Generate deployment report
+        run: |
+          echo "## Deployment Summary" > deployment-report.md
+          echo "* Environment: ${{ github.event.inputs.environment || 'staging' }}" >> deployment-report.md
+          echo "* Deployment Time: $(date)" >> deployment-report.md
+          echo "* Build ID: ${{ github.run_id }}" >> deployment-report.md
+          echo "* Deployed By: ${{ github.actor }}" >> deployment-report.md
+      
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-report
+          path: deployment-report.md
