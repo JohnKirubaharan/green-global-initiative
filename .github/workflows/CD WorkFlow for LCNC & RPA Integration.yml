@@ -1,6 +1,3 @@
-## 2. GitHub Actions Workflow Definition
-
-```yaml
 # Main CI/CD workflow for Low-Code and RPA integration
 name: Power Apps CI/CD Pipeline
 
